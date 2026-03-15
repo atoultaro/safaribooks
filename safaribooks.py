@@ -1364,13 +1364,31 @@ class SafariBooks:
             ))
             spine.append("<itemref idref=\"{0}\"/>".format(item_id))
 
+        image_id_map = {}
+        used_image_ids = set()
         for i in set(self.images):
-            dot_split = i.split(".")
-            head = "img_" + escape("".join(dot_split[:-1]))
-            extension = dot_split[-1]
+            dot_split = i.rsplit(".", 1)
+            image_stem = dot_split[0]
+            extension = dot_split[1] if len(dot_split) == 2 else ""
+
+            head = "img_" + re.sub(r"[^A-Za-z0-9_-]", "_", image_stem)
+            base_head = head
+            suffix = 2
+            while head in used_image_ids:
+                head = "%s_%s" % (base_head, suffix)
+                suffix += 1
+
+            used_image_ids.add(head)
+            image_id_map[i] = head
+
             manifest.append("<item id=\"{0}\" href=\"Images/{1}\" media-type=\"image/{2}\" />".format(
                 head, i, "jpeg" if "jp" in extension else extension
             ))
+
+        cover_filename = os.path.basename(str(self.cover or "")).split("?", 1)[0].split("#", 1)[0]
+        cover_id = image_id_map.get(cover_filename, "")
+        if not cover_id and len(image_id_map):
+            cover_id = next(iter(image_id_map.values()))
 
         for i in range(len(self.css)):
             manifest.append("<item id=\"style_{0:0>2}\" href=\"Styles/Style{0:0>2}.css\" "
@@ -1392,7 +1410,7 @@ class SafariBooks:
             ", ".join(escape(pub.get("name", "")) for pub in self.book_info.get("publishers", [])),
             escape(self.book_info.get("rights", "")),
             self.book_info.get("issued", ""),
-            self.cover,
+            cover_id,
             "\n".join(manifest),
             "\n".join(spine),
             self.book_chapters[0]["filename"].replace(".html", ".xhtml")
