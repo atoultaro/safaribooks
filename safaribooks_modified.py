@@ -7,6 +7,7 @@ import json
 import shutil
 import pathlib
 import getpass
+import time
 import logging
 import argparse
 import requests
@@ -313,6 +314,13 @@ class SafariBooks:
     }
 
     COOKIE_FLOAT_MAX_AGE_PATTERN = re.compile(r'(max-age=\d*\.\d*)', re.IGNORECASE)
+    CHAPTER_FETCH_RETRIES = 6
+    CHAPTER_FETCH_RETRY_BASE_DELAY = 1.2
+    CHAPTER_FETCH_RETRY_MAX_DELAY = 12.0
+    CHAPTER_FETCH_PACING_SECONDS = 0.08
+    PROFILE_CHECK_RETRIES = 6
+    PROFILE_CHECK_RETRY_BASE_DELAY = 1.5
+    PROFILE_CHECK_RETRY_MAX_DELAY = 20.0
 
     def __init__(self, args):
         self.args = args
@@ -408,6 +416,8 @@ class SafariBooks:
         self.images_done_queue = Queue(0) if "win" not in sys.platform else WinQueue()
         self.display.info("Downloading book images... (%s files)" % len(self.images), state=True)
         self.collect_images()
+
+        self._normalize_book_chapters()
 
         self.display.info("Creating EPUB file...", state=True)
         self.create_epub()
@@ -524,15 +534,35 @@ class SafariBooks:
             self.display.exit("Login: unable to reach Safari Books Online. Try again...")
 
     def check_login(self):
-        response = self.requests_provider(PROFILE_URL, perform_redirect=False)
+        retriable_statuses = {403, 408, 409, 425, 429, 500, 502, 503, 504}
+        response = 0
 
-        if response == 0:
-            self.display.exit("Login: unable to reach Safari Books Online. Try again...")
+        for attempt in range(1, self.PROFILE_CHECK_RETRIES + 1):
+            response = self.requests_provider(PROFILE_URL, perform_redirect=False)
 
-        elif response.status_code != 200:
+            if response != 0 and response.status_code == 200:
+                break
+
+            status_code = response.status_code if response != 0 else "n/a"
+            if attempt < self.PROFILE_CHECK_RETRIES and (response == 0 or (response != 0 and response.status_code in retriable_statuses)):
+                delay = min(
+                    self.PROFILE_CHECK_RETRY_BASE_DELAY * (2 ** (attempt - 1)),
+                    self.PROFILE_CHECK_RETRY_MAX_DELAY
+                ) + (random() * 0.35)
+                self.display.info(
+                    "Authentication check got HTTP %s; retrying in %.1fs (%s/%s)." %
+                    (status_code, delay, attempt, self.PROFILE_CHECK_RETRIES),
+                    state=True
+                )
+                time.sleep(delay)
+                continue
+
+            if response == 0:
+                self.display.exit("Login: unable to reach Safari Books Online. Try again...")
+
             self.display.exit("Authentication issue: unable to access profile page.")
 
-        elif "user_type\":\"Expired\"" in response.text:
+        if "user_type\":\"Expired\"" in response.text:
             self.display.exit("Authentication issue: account subscription expired.")
 
         self.display.info("Successfully authenticated.", state=True)
@@ -677,13 +707,21 @@ class SafariBooks:
             return False
 
         suffix = pathlib.Path(basename).suffix.lower()
-        if suffix in {".html", ".xhtml", ".css", ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".bmp", ".ico"}:
+        if suffix in {".htm", ".html", ".xhtm", ".xhtml", ".css", ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".bmp", ".ico"}:
             if basename.startswith("."):
                 return False
             if not pathlib.Path(basename).stem.strip(". "):
                 return False
 
         return True
+
+    @staticmethod
+    def _is_navigation_document(path):
+        if not isinstance(path, str):
+            return False
+
+        basename = pathlib.Path(path.split("?", 1)[0].split("#", 1)[0]).name.lower()
+        return basename in {"nav.htm", "nav.html", "nav.xhtm", "nav.xhtml"}
 
     def get_book_info_v2(self):
         candidates = self._book_id_candidates()
@@ -837,7 +875,7 @@ class SafariBooks:
                 unique_refs[ref["path"]] = ref["url"]
 
         refs = [{"path": p, "url": u} for p, u in unique_refs.items()]
-        refs = sorted(refs, key=lambda x: x["path"])
+        refs = sorted(refs, key=lambda x: self._natural_sort_key(x["path"]))
 
         self.display.log(
             "V2 files discovered for `%s`: %s entries (sample: %s)" %
@@ -851,7 +889,11 @@ class SafariBooks:
             )
         )
 
-        html_files = [x for x in refs if x["path"].lower().endswith((".html", ".xhtml"))]
+        html_files = [
+            x for x in refs
+            if x["path"].lower().endswith((".htm", ".html", ".xhtm", ".xhtml"))
+            and not self._is_navigation_document(x["path"])
+        ]
         css_files = [x for x in refs if x["path"].lower().endswith(".css")]
         image_files = [
             x for x in refs if x["path"].lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".bmp"))
@@ -920,8 +962,27 @@ class SafariBooks:
         return "default_cover." + file_ext
 
     def get_html(self, url):
-        response = self.requests_provider(url)
-        if response == 0 or response.status_code != 200:
+        retriable_statuses = {403, 408, 409, 425, 429, 500, 502, 503, 504}
+        response = 0
+        for attempt in range(1, self.CHAPTER_FETCH_RETRIES + 1):
+            response = self.requests_provider(url)
+            if response != 0 and response.status_code == 200:
+                break
+
+            status_code = response.status_code if response != 0 else "n/a"
+            if response != 0 and response.status_code in retriable_statuses and attempt < self.CHAPTER_FETCH_RETRIES:
+                delay = min(
+                    self.CHAPTER_FETCH_RETRY_BASE_DELAY * (2 ** (attempt - 1)),
+                    self.CHAPTER_FETCH_RETRY_MAX_DELAY
+                ) + (random() * 0.35)
+                self.display.info(
+                    "Crawler: temporary HTTP %s while retrieving `%s`; retrying in %.1fs (%s/%s)." %
+                    (status_code, self.filename, delay, attempt, self.CHAPTER_FETCH_RETRIES),
+                    state=True
+                )
+                time.sleep(delay)
+                continue
+
             self.display.exit(
                 "Crawler: error trying to retrieve this page: %s (%s)\n    From: %s" %
                 (self.filename, self.chapter_title, url)
@@ -958,17 +1019,47 @@ class SafariBooks:
     def is_image_link(url: str):
         return pathlib.Path(url).suffix[1:].lower() in ["jpg", "jpeg", "png", "gif"]
 
+    @staticmethod
+    def to_xhtml_path(path):
+        if not isinstance(path, str) or not path:
+            return path
+
+        fragment_split = path.split("#", 1)
+        query_split = fragment_split[0].split("?", 1)
+
+        base = re.sub(r"\.(x?html?)$", ".xhtml", query_split[0], flags=re.IGNORECASE)
+
+        if len(query_split) == 2:
+            base += "?" + query_split[1]
+        if len(fragment_split) == 2:
+            base += "#" + fragment_split[1]
+
+        return base
+
+    def _relative_oebps_href(self, target_path):
+        target = (target_path or "").lstrip("/")
+        chapter_file = self.to_xhtml_path(getattr(self, "filename", "") or "")
+        chapter_file = chapter_file.replace("\\", "/")
+        chapter_dir = pathlib.PurePosixPath(chapter_file).parent
+        depth = 0 if str(chapter_dir) == "." else len(chapter_dir.parts)
+        return ("../" * depth) + target
+
     def link_replace(self, link):
         if link and not link.startswith("mailto"):
             if not self.url_is_absolute(link):
                 if any(x in link for x in ["cover", "images", "graphics"]) or \
                         self.is_image_link(link):
                     image = link.split("/")[-1]
-                    return "Images/" + image
+                    return self._relative_oebps_href("Images/" + image)
 
-                return link.replace(".html", ".xhtml")
+                return self.to_xhtml_path(link)
 
             else:
+                link_path = urlparse(link).path
+                if any(x in link_path.lower() for x in ["cover", "images", "graphics"]) or self.is_image_link(link_path):
+                    image = link_path.split("/")[-1].split("?", 1)[0].split("#", 1)[0]
+                    return self._relative_oebps_href("Images/" + image)
+
                 if self.book_id in link:
                     return self.link_replace(link.split(self.book_id)[-1])
 
@@ -996,6 +1087,337 @@ class SafariBooks:
             return a[0]
 
         return None
+
+    @staticmethod
+    def _normalize_text(text):
+        if not isinstance(text, str):
+            return ""
+
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _natural_sort_key(text):
+        normalized = SafariBooks._normalize_text(str(text).replace("\\", "/").lower())
+        if not normalized:
+            return ((1, ""),)
+
+        tokens = re.findall(r"\d+|[a-z]+", normalized)
+        if not tokens:
+            return ((1, normalized),)
+
+        return tuple((0, int(token)) if token.isdigit() else (1, token) for token in tokens)
+
+    @staticmethod
+    def _title_contains_any(title, keywords):
+        return any(keyword in title for keyword in keywords)
+
+    @staticmethod
+    def _flatten_toc_entries(entries):
+        flattened = []
+        for entry in entries:
+            flattened.append(entry)
+            children = entry.get("children", [])
+            if children:
+                flattened.extend(SafariBooks._flatten_toc_entries(children))
+
+        return flattened
+
+    def _chapter_relative_path(self, chapter):
+        return self.to_xhtml_path(chapter.get("filename", "")).replace("\\", "/")
+
+    def _chapter_local_path(self, chapter):
+        return os.path.join(self.BOOK_PATH, "OEBPS", self._chapter_relative_path(chapter))
+
+    def _load_local_toc_entries(self):
+        cached_entries = getattr(self, "_cached_local_toc_entries", None)
+        if cached_entries is not None:
+            return cached_entries
+
+        oebps_root = os.path.join(self.BOOK_PATH, "OEBPS")
+        if not os.path.isdir(oebps_root):
+            self._cached_local_toc_entries = []
+            return []
+
+        candidate_paths = []
+        for current_root, _dirs, files in os.walk(oebps_root):
+            for filename in files:
+                if filename.lower() in {"toc.xhtml", "toc.html", "toc.htm", "nav.xhtml", "nav.html", "nav.htm"}:
+                    candidate_paths.append(os.path.join(current_root, filename))
+
+        if not len(candidate_paths):
+            self._cached_local_toc_entries = []
+            return []
+
+        candidate_paths.sort(key=lambda path: self._natural_sort_key(os.path.relpath(path, oebps_root)))
+        toc_path = candidate_paths[0]
+
+        try:
+            parsed = html.parse(toc_path)
+            root = parsed.getroot()
+        except Exception:
+            self._cached_local_toc_entries = []
+            return []
+
+        content = root.xpath("//div[@id='sbo-rt-content']")
+        scope = content[0] if len(content) else root
+        relative_toc_path = os.path.relpath(toc_path, oebps_root).replace("\\", "/")
+        toc_dir = pathlib.PurePosixPath(relative_toc_path).parent
+
+        seen = set()
+        entries = []
+        for index, anchor in enumerate(scope.xpath(".//a[@href]"), start=1):
+            href = (anchor.get("href") or "").strip()
+            if not href or href.startswith(("#", "mailto:", "javascript:")) or self.url_is_absolute(href):
+                continue
+
+            href_base = href.split("#", 1)[0]
+            if not href_base:
+                continue
+
+            resolved_href = self.to_xhtml_path(
+                str((toc_dir / href_base).as_posix()) if str(toc_dir) != "." else href_base
+            )
+            normalized_href = resolved_href.split("#", 1)[0]
+            if os.path.basename(normalized_href).lower() in {"toc.xhtml", "toc.html", "toc.htm", "nav.xhtml", "nav.html", "nav.htm"}:
+                continue
+
+            label = self._normalize_text(" ".join(anchor.xpath(".//text()")))
+            if not label or normalized_href in seen:
+                continue
+
+            seen.add(normalized_href)
+            entries.append({
+                "id": "local_toc_%s" % index,
+                "fragment": "",
+                "label": label,
+                "href": resolved_href,
+                "depth": 1,
+                "children": []
+            })
+
+        self._cached_local_toc_entries = entries
+        return entries
+
+    def _get_local_toc_order_map(self):
+        cached_map = getattr(self, "_cached_local_toc_order_map", None)
+        if cached_map is not None:
+            return cached_map
+
+        order_map = {}
+        for index, entry in enumerate(self._load_local_toc_entries()):
+            href = self.to_xhtml_path(entry.get("href", "")).split("#", 1)[0]
+            if href and href not in order_map:
+                order_map[href] = index
+
+        self._cached_local_toc_order_map = order_map
+        return order_map
+
+    @staticmethod
+    def _chapter_stem(rel_path):
+        return pathlib.PurePosixPath(rel_path).stem.lower()
+
+    def _is_non_linear_spine_path(self, rel_path):
+        stem = self._chapter_stem(rel_path)
+        basename = pathlib.PurePosixPath(rel_path).name.lower()
+        if basename in {"toc.xhtml", "toc.html", "toc.htm", "nav.xhtml", "nav.html", "nav.htm"}:
+            return True
+
+        return bool(re.match(r"popdef\d+[a-z]?$", stem))
+
+    def _cover_reference_href(self):
+        for candidate in self.book_chapters:
+            rel_path = self._chapter_relative_path(candidate)
+            stem = self._chapter_stem(rel_path)
+            if rel_path == "default_cover.xhtml" or "cover" in stem:
+                return rel_path
+
+        for candidate in self.book_chapters:
+            rel_path = self._chapter_relative_path(candidate)
+            if not self._is_non_linear_spine_path(rel_path):
+                return rel_path
+
+        return self.to_xhtml_path(self.book_chapters[0]["filename"])
+
+    def _refresh_chapter_title(self, chapter):
+        file_path = self._chapter_local_path(chapter)
+        current_title = chapter.get("title", "")
+        inferred_title = self._extract_title_from_existing_file(file_path, current_title)
+        if inferred_title and inferred_title != current_title:
+            chapter["title"] = inferred_title
+
+        return self._normalize_text(chapter.get("title", ""))
+
+    def _chapter_order_key(self, chapter):
+        rel_path = self._chapter_relative_path(chapter)
+        stem = self._chapter_stem(rel_path)
+        title = self._refresh_chapter_title(chapter).lower()
+        toc_order_map = self._get_local_toc_order_map()
+
+        front_keywords = (
+            "preface", "foreword", "forward", "acknowledg", "introduction", "prologue",
+            "dedication", "contents", "table of contents", "about this book"
+        )
+        back_keywords = (
+            "bibliography", "references", "reference", "index", "glossary", "appendix",
+            "appendices", "about the author", "afterword", "epilogue", "notes"
+        )
+        auxiliary_tail_keywords = (
+            "copyright", "title page", "publisher", "published by", "library of congress",
+            "cover design", "wiley", "john wiley"
+        )
+
+        natural_key = self._natural_sort_key(rel_path)
+
+        if self._is_non_linear_spine_path(rel_path):
+            return (98, 0, 0, natural_key)
+
+        if "cover" in stem or title == "cover":
+            return (0, 0, 0, natural_key)
+
+        if stem == "title":
+            return (1, 0, 0, natural_key)
+
+        if stem == "copyright":
+            return (2, 0, 0, natural_key)
+
+        if rel_path in toc_order_map:
+            return (10, toc_order_map[rel_path], 0, natural_key)
+
+        chapter_match = re.search(r"(?:^|[_/-])(?:epub_)?ch[_-]?(\d+)$", stem)
+        if chapter_match:
+            return (20, int(chapter_match.group(1)), 0, natural_key)
+
+        chapter_fragment_match = re.match(r"c(\d+)-(\d+)$", stem)
+        if chapter_fragment_match:
+            return (20, int(chapter_fragment_match.group(1)), int(chapter_fragment_match.group(2)), natural_key)
+
+        chapter_test_match = re.match(r"test[_-](\d+)-(\d+)([a-z]?)$", stem)
+        if chapter_test_match:
+            answer_suffix = 1 if chapter_test_match.group(3) else 0
+            parent_chapter_path = pathlib.PurePosixPath(rel_path).with_name(
+                "c%02d.xhtml" % int(chapter_test_match.group(1))
+            ).as_posix()
+            parent_order = toc_order_map.get(parent_chapter_path)
+            if parent_order is not None:
+                return (
+                    10,
+                    parent_order,
+                    1,
+                    int(chapter_test_match.group(2)),
+                    answer_suffix,
+                    natural_key
+                )
+            return (
+                29,
+                int(chapter_test_match.group(1)),
+                int(chapter_test_match.group(2)),
+                answer_suffix,
+                natural_key
+            )
+
+        if stem.startswith("prf-") or self._title_contains_any(title, front_keywords):
+            return (10, 0, 0, natural_key)
+
+        if stem.startswith("bm") or "_epub_bm_" in stem or self._title_contains_any(title, back_keywords):
+            return (90, 0, 0, natural_key)
+
+        if "_epub_fm_" in stem or "_epub_cov" in stem or self._title_contains_any(title, auxiliary_tail_keywords):
+            return (95, 0, 0, natural_key)
+
+        return (50, 0, 0, natural_key)
+
+    def _normalize_book_chapters(self):
+        original_paths = [self._chapter_relative_path(chapter) for chapter in self.book_chapters]
+        self.book_chapters = sorted(self.book_chapters, key=self._chapter_order_key)
+        normalized_paths = [self._chapter_relative_path(chapter) for chapter in self.book_chapters]
+
+        if original_paths != normalized_paths:
+            self.display.log(
+                "Normalized chapter order from `%s` to `%s`." %
+                (
+                    ", ".join(original_paths[:8]),
+                    ", ".join(normalized_paths[:8])
+                )
+            )
+
+    def _extract_semantic_title(self, root, fallback=""):
+        if root is None:
+            return fallback
+
+        content = root.xpath("//div[@id='sbo-rt-content']")
+        if not len(content):
+            title_tag = root.xpath("//title/text()")
+            if len(title_tag):
+                return self._normalize_text(title_tag[0]) or fallback
+            return fallback
+
+        content = content[0]
+
+        def first_text(xpath_expr):
+            nodes = content.xpath(xpath_expr)
+            if not len(nodes):
+                return ""
+
+            node = nodes[0]
+            if isinstance(node, str):
+                return self._normalize_text(node)
+
+            text_bits = node.xpath(".//text()")
+            return self._normalize_text(" ".join(text_bits))
+
+        def first_class_text(class_names):
+            if not isinstance(class_names, (list, tuple)):
+                class_names = [class_names]
+
+            for class_name in class_names:
+                xpath_token = ".//*[contains(concat(' ', normalize-space(@class), ' '), ' %s ')]" % class_name
+                value = first_text(xpath_token)
+                if value:
+                    return value
+
+                # Preserve support for class variants like "chaptitle1".
+                xpath_contains = ".//*[contains(@class, '%s')]" % class_name
+                value = first_text(xpath_contains)
+                if value:
+                    return value
+
+            return ""
+
+        part_num = first_class_text(["partnum", "part_num", "pt"])
+        part_title = first_class_text(["parttitle", "part_title", "pst"])
+        if part_num and part_title:
+            return "%s - %s" % (part_num, part_title)
+        if part_title:
+            return part_title
+
+        chap_num = first_class_text(["chapnum", "chapter-number", "chapternum", "ct"])
+        chap_title = first_class_text(["chaptitle", "chapter-title", "chaptertitle", "cst"])
+        if chap_num and chap_title:
+            return "%s - %s" % (chap_num, chap_title)
+        if chap_title:
+            return chap_title
+
+        for xp in [".//h1", ".//h2", ".//h3"]:
+            heading = first_text(xp)
+            if heading:
+                return heading
+
+        title_tag = root.xpath("//title/text()")
+        if len(title_tag):
+            return self._normalize_text(title_tag[0]) or fallback
+
+        return fallback
+
+    def _extract_title_from_existing_file(self, file_path, fallback=""):
+        if not os.path.isfile(file_path):
+            return fallback
+
+        try:
+            parsed = html.parse(file_path)
+            root = parsed.getroot()
+            return self._extract_semantic_title(root, fallback)
+        except Exception:
+            return fallback
 
     # def parse_html(self, root, first_page=False):
     def parse_html(self, root, url, first_page=False):
@@ -1032,8 +1454,10 @@ class SafariBooks:
                     self.css.append(chapter_css_url)
                     self.display.log("Crawler: found a new CSS at %s" % chapter_css_url)
 
-                page_css += "<link href=\"Styles/Style{0:0>2}.css\" " \
-                            "rel=\"stylesheet\" type=\"text/css\" />\n".format(self.css.index(chapter_css_url))
+                page_css += "<link href=\"{0}\" " \
+                            "rel=\"stylesheet\" type=\"text/css\" />\n".format(
+                                self._relative_oebps_href("Styles/Style{0:0>2}.css".format(self.css.index(chapter_css_url)))
+                            )
 
         stylesheet_links = root.xpath("//link[@rel='stylesheet']")
         if len(stylesheet_links):
@@ -1045,8 +1469,10 @@ class SafariBooks:
                     self.css.append(css_url)
                     self.display.log("Crawler: found a new CSS at %s" % css_url)
 
-                page_css += "<link href=\"Styles/Style{0:0>2}.css\" " \
-                            "rel=\"stylesheet\" type=\"text/css\" />\n".format(self.css.index(css_url))
+                page_css += "<link href=\"{0}\" " \
+                            "rel=\"stylesheet\" type=\"text/css\" />\n".format(
+                                self._relative_oebps_href("Styles/Style{0:0>2}.css".format(self.css.index(css_url)))
+                            )
 
         stylesheets = root.xpath("//style")
         if len(stylesheets):
@@ -1155,7 +1581,7 @@ class SafariBooks:
             self.display.images_ad_info.value = 1
 
     def save_page_html(self, contents):
-        self.filename = self.filename.replace(".html", ".xhtml")
+        self.filename = self.to_xhtml_path(self.filename)
         output_path = os.path.join(self.BOOK_PATH, "OEBPS", self.filename)
         output_dir = os.path.dirname(output_path)
         if output_dir and not os.path.isdir(output_dir):
@@ -1205,23 +1631,36 @@ class SafariBooks:
             if "site_styles" in next_chapter and len(next_chapter["site_styles"]):
                 self.chapter_stylesheets.extend(next_chapter["site_styles"])
 
-            if os.path.isfile(os.path.join(self.BOOK_PATH, "OEBPS", self.filename.replace(".html", ".xhtml"))):
+            output_file = os.path.join(self.BOOK_PATH, "OEBPS", self.to_xhtml_path(self.filename))
+            if os.path.isfile(output_file):
+                inferred_title = self._extract_title_from_existing_file(output_file, next_chapter.get("title", ""))
+                if inferred_title and inferred_title != next_chapter.get("title", ""):
+                    next_chapter["title"] = inferred_title
+                    self.chapter_title = inferred_title
+
                 if not self.display.book_ad_info and \
                         next_chapter not in self.book_chapters[:self.book_chapters.index(next_chapter)]:
                     self.display.info(
                         ("File `%s` already exists.\n"
                          "    If you want to download again all the book,\n"
                          "    please delete the output directory '" + self.BOOK_PATH + "' and restart the program.")
-                         % self.filename.replace(".html", ".xhtml")
+                         % self.to_xhtml_path(self.filename)
                     )
                     self.display.book_ad_info = 2
 
             else:
-                # self.save_page_html(self.parse_html(self.get_html(next_chapter["content"]), first_page))
                 chapter_ = next_chapter["content"]
                 html_ = self.get_html(chapter_)
+                inferred_title = self._extract_semantic_title(html_, next_chapter.get("title", ""))
+                if inferred_title and inferred_title != next_chapter.get("title", ""):
+                    next_chapter["title"] = inferred_title
+                    self.chapter_title = inferred_title
+
                 parsed_page_ = self.parse_html(html_, chapter_, first_page)
                 self.save_page_html(parsed_page_)
+
+            if api_v2_detected and self.CHAPTER_FETCH_PACING_SECONDS > 0:
+                time.sleep(self.CHAPTER_FETCH_PACING_SECONDS)
 
             self.display.state(len_books, len_books - len(self.chapters_queue))
 
@@ -1312,13 +1751,15 @@ class SafariBooks:
 
         manifest = []
         spine = []
+        cover_href = self._cover_reference_href()
         for c in self.book_chapters:
-            c["filename"] = c["filename"].replace(".html", ".xhtml")
+            c["filename"] = self.to_xhtml_path(c["filename"])
             item_id = escape(re.sub(r"[^A-Za-z0-9_-]", "_", "".join(c["filename"].split(".")[:-1])))
             manifest.append("<item id=\"{0}\" href=\"{1}\" media-type=\"application/xhtml+xml\" />".format(
                 item_id, c["filename"]
             ))
-            spine.append("<itemref idref=\"{0}\"/>".format(item_id))
+            if not self._is_non_linear_spine_path(c["filename"]):
+                spine.append("<itemref idref=\"{0}\"/>".format(item_id))
 
         image_id_map = {}
         used_image_ids = set()
@@ -1369,7 +1810,7 @@ class SafariBooks:
             cover_id,
             "\n".join(manifest),
             "\n".join(spine),
-            self.book_chapters[0]["filename"].replace(".html", ".xhtml")
+            cover_href
         )
 
     @staticmethod
@@ -1385,8 +1826,8 @@ class SafariBooks:
                  "<content src=\"{3}\"/>".format(
                     cc["fragment"] if len(cc["fragment"]) else cc["id"], c,
                     escape(cc["label"]),
-                    cc["href"].replace(".html", ".xhtml").split("/files/", 1)[-1]
-                    if cc["href"].startswith("http") else cc["href"].replace(".html", ".xhtml")
+                    SafariBooks.to_xhtml_path(cc["href"].split("/files/", 1)[-1])
+                    if cc["href"].startswith("http") else SafariBooks.to_xhtml_path(cc["href"])
                  )
 
             if cc["children"]:
@@ -1398,13 +1839,58 @@ class SafariBooks:
         return r, c, mx
 
     def create_toc(self):
+        local_toc_entries = self._load_local_toc_entries()
+        if len(local_toc_entries):
+            self.display.log("Using downloaded local TOC document to generate ncx.")
+            navmap, _, max_depth = self.parse_toc(local_toc_entries)
+            return self.TOC_NCX.format(
+                (self.book_info["isbn"] if self.book_info["isbn"] else self.book_id),
+                max_depth,
+                self.book_title,
+                ", ".join(aut.get("name", "") for aut in self.book_info.get("authors", [])),
+                navmap
+            )
+
         response = self.requests_provider(urljoin(self.api_url, "toc/"))
         payload = None
         if response != 0 and response.status_code == 200:
             payload = self.parse_json_response(response, "toc v1")
 
         if isinstance(payload, list):
-            navmap, _, max_depth = self.parse_toc(payload)
+            flattened = self._flatten_toc_entries(payload)
+            payload_paths = []
+            payload_label_map = {}
+            for entry in flattened:
+                href = entry.get("href", "")
+                if not href:
+                    continue
+
+                normalized_href = (
+                    self.to_xhtml_path(href.split("/files/", 1)[-1])
+                    if href.startswith("http") else self.to_xhtml_path(href)
+                ).split("#", 1)[0]
+
+                payload_paths.append(normalized_href)
+                if normalized_href not in payload_label_map and entry.get("label"):
+                    payload_label_map[normalized_href] = entry["label"]
+
+            chapter_paths = [self._chapter_relative_path(chapter).split("#", 1)[0] for chapter in self.book_chapters]
+            if payload_paths == chapter_paths:
+                navmap, _, max_depth = self.parse_toc(payload)
+            else:
+                self.display.log("Legacy TOC order disagrees with normalized spine; generating flat TOC from chapters.")
+                synthetic_toc = [{
+                    "id": "chap_%s" % i,
+                    "fragment": "",
+                    "label": payload_label_map.get(
+                        self._chapter_relative_path(chapter).split("#", 1)[0],
+                        chapter.get("title", "Chapter %s" % i)
+                    ),
+                    "href": chapter.get("filename", ""),
+                    "depth": 1,
+                    "children": []
+                } for i, chapter in enumerate(self.book_chapters, start=1)]
+                navmap, _, max_depth = self.parse_toc(synthetic_toc)
         else:
             self.display.info("Legacy TOC endpoint unavailable; generating TOC from downloaded chapter list.")
             synthetic_toc = [{
